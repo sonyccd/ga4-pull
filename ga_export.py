@@ -5,10 +5,10 @@ import argparse
 import csv
 import logging
 import os
+import re
 import sys
-import time
 import warnings
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 # The Google client libraries emit Python-version and OpenSSL deprecation warnings on
 # import that would otherwise flood a long-running export log.
@@ -26,15 +26,37 @@ from google.analytics.data_v1beta.types import (
     RunReportRequest,
 )
 from google.api_core import exceptions as gexc
-from google.auth.exceptions import DefaultCredentialsError
+from google.api_core import retry as gretry
+from google.auth.exceptions import GoogleAuthError
 
-PAGE_LIMIT = 100000
+PAGE_LIMIT = 250000  # documented maximum rows per runReport request
 MAX_DIMENSIONS = 9  # GA4 Data API limit per request, including the implicit "date"
 MAX_METRICS = 10
-MAX_RETRIES = 8
-MAX_BACKOFF_SECONDS = 300
+BUCKET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+# The generated client gives run_report a 60s timeout and no retry. A full page can take
+# longer than that, and quota and 5xx errors are routine, so every page is sent with an
+# explicit per-attempt timeout and a jittered exponential-backoff retry policy.
+REQUEST_TIMEOUT_SECONDS = 300
+RETRY_INITIAL_SECONDS = 5
+RETRY_MAX_SLEEP_SECONDS = 300
+RETRY_DEADLINE_SECONDS = 900
+RETRYABLE_ERRORS = (
+    gexc.TooManyRequests,  # 429; ResourceExhausted (quota) is a subclass
+    gexc.ServiceUnavailable,
+    gexc.InternalServerError,
+    gexc.DeadlineExceeded,
+)
 
 log = logging.getLogger("ga_export")
+
+
+class InconsistentReport(Exception):
+    """The report changed between pages, so the pages cannot be stitched into one file."""
+
+
+def today():
+    return date.today()
 
 
 # ---------------------------------------------------------------- list-properties
@@ -42,8 +64,12 @@ log = logging.getLogger("ga_export")
 
 def list_properties(args):
     client = AnalyticsAdminServiceClient()
+    try:
+        summaries = list(client.list_account_summaries())
+    except gexc.GoogleAPICallError as e:
+        sys.exit(f"Could not list properties: {e}")
     rows = []
-    for summary in client.list_account_summaries():
+    for summary in summaries:
         for prop in summary.property_summaries:
             rows.append(
                 (summary.display_name, prop.property.split("/")[-1], prop.display_name)
@@ -63,14 +89,14 @@ def list_properties(args):
 
 def load_buckets(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except FileNotFoundError:
         sys.exit(f"Config file not found: {path}")
     except yaml.YAMLError as e:
         sys.exit(f"Could not parse {path}: {e}")
 
-    buckets = (data or {}).get("buckets") if isinstance(data, dict) else None
+    buckets = data.get("buckets") if isinstance(data, dict) else None
     if not isinstance(buckets, list) or not buckets:
         sys.exit(f"{path}: expected a non-empty top-level 'buckets' list")
 
@@ -81,8 +107,11 @@ def load_buckets(path):
         name = b["name"]
         if name in seen:
             sys.exit(f"{path}: duplicate bucket name '{name}'")
-        if os.sep in name or name in (".", ".."):
-            sys.exit(f"{path}: bucket name '{name}' is not a valid file name")
+        if not BUCKET_NAME_RE.match(name) or name in (".", ".."):
+            sys.exit(
+                f"{path}: bucket name '{name}' is not a valid file name "
+                "(use letters, digits, '_', '-' and '.')"
+            )
         seen.add(name)
 
         dims = b.get("dimensions") or []
@@ -91,6 +120,10 @@ def load_buckets(path):
             sys.exit(f"{path}: bucket '{name}': 'dimensions' must be a list of strings")
         if not isinstance(mets, list) or not mets or not all(isinstance(m, str) for m in mets):
             sys.exit(f"{path}: bucket '{name}': 'metrics' must be a non-empty list of strings")
+        if len(set(dims)) != len(dims):
+            sys.exit(f"{path}: bucket '{name}': 'dimensions' contains a duplicate")
+        if len(set(mets)) != len(mets):
+            sys.exit(f"{path}: bucket '{name}': 'metrics' contains a duplicate")
 
         dims = ["date"] + [d for d in dims if d != "date"]
         if len(dims) > MAX_DIMENSIONS:
@@ -110,29 +143,31 @@ def load_buckets(path):
 # ---------------------------------------------------------------- extract
 
 
-def run_with_retry(client, request, label):
-    attempt = 0
-    while True:
-        try:
-            return client.run_report(request)
-        except (gexc.ResourceExhausted, gexc.TooManyRequests) as e:
-            if attempt >= MAX_RETRIES:
-                log.error("%s giving up after %d retries on quota/rate limit", label, MAX_RETRIES)
-                raise
-            wait = min(MAX_BACKOFF_SECONDS, 5 * 2 ** attempt)
-            attempt += 1
-            log.warning(
-                "%s quota/rate limit hit (%s); retry %d/%d in %ds",
-                label, e.message, attempt, MAX_RETRIES, wait,
-            )
-            time.sleep(wait)
+def retry_policy(label):
+    """Retry policy for one bucket: retries quota, 5xx and timeout errors with jittered
+    exponential backoff (up to RETRY_MAX_SLEEP_SECONDS between attempts) for up to
+    RETRY_DEADLINE_SECONDS, then raises google.api_core.exceptions.RetryError."""
+
+    def on_error(exc):
+        log.warning("%s transient error (%s); retrying", label, exc)
+
+    return gretry.Retry(
+        predicate=gretry.if_exception_type(*RETRYABLE_ERRORS),
+        initial=RETRY_INITIAL_SECONDS,
+        maximum=RETRY_MAX_SLEEP_SECONDS,
+        multiplier=2,
+        timeout=RETRY_DEADLINE_SECONDS,
+        on_error=on_error,
+    )
 
 
 def export_bucket(client, property_id, bucket, start_date, end_date, csv_path, label):
     """Stream every page of the report into csv_path + '.part', then rename. Returns row count."""
     part_path = csv_path + ".part"
+    retry = retry_policy(label)
     offset = 0
-    with open(part_path, "w", newline="") as f:
+    total = None
+    with open(part_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         while True:
             request = RunReportRequest(
@@ -144,11 +179,17 @@ def export_bucket(client, property_id, bucket, start_date, end_date, csv_path, l
                 limit=PAGE_LIMIT,
                 offset=offset,
             )
-            response = run_with_retry(client, request, label)
-            if offset == 0:
+            response = client.run_report(request, retry=retry, timeout=REQUEST_TIMEOUT_SECONDS)
+            if total is None:
+                total = response.row_count
                 writer.writerow(
                     [h.name for h in response.dimension_headers]
                     + [h.name for h in response.metric_headers]
+                )
+            elif response.row_count != total:
+                raise InconsistentReport(
+                    f"row count changed from {total} to {response.row_count} between pages; "
+                    "the report is still changing (is --end-date too recent?)"
                 )
             for row in response.rows:
                 writer.writerow(
@@ -157,8 +198,8 @@ def export_bucket(client, property_id, bucket, start_date, end_date, csv_path, l
                 )
             page_rows = len(response.rows)
             offset += page_rows
-            log.info("%s fetched %d/%d rows", label, offset, response.row_count)
-            if page_rows == 0 or offset >= response.row_count:
+            log.info("%s fetched %d/%d rows", label, offset, total)
+            if page_rows == 0 or offset >= total:
                 break
     os.replace(part_path, csv_path)
     return offset
@@ -171,16 +212,43 @@ def parse_date(value, flag):
         sys.exit(f"{flag} must be YYYY-MM-DD, got '{value}'")
 
 
+def parse_property_ids(value):
+    """Accept '123' or 'properties/123', comma-separated. Drops duplicates, rejects junk."""
+    ids = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        pid = token[len("properties/"):] if token.startswith("properties/") else token
+        if not pid.isdigit():
+            sys.exit(
+                f"--properties: '{token}' is not a GA4 property ID "
+                "(expected digits, or properties/<digits>)"
+            )
+        if pid in ids:
+            log.warning("--properties: ignoring duplicate property ID %s", pid)
+            continue
+        ids.append(pid)
+    if not ids:
+        sys.exit("--properties must contain at least one property ID")
+    return ids
+
+
 def extract(args):
     start = parse_date(args.start_date, "--start-date")
     end = parse_date(args.end_date, "--end-date")
     if start > end:
         sys.exit(f"--start-date {args.start_date} is after --end-date {args.end_date}")
+    if end > today():
+        sys.exit(f"--end-date {args.end_date} is in the future")
+    if end >= today() - timedelta(days=2):
+        log.warning(
+            "--end-date %s is within the last 48 hours; GA4 may still be processing that data, "
+            "so the most recent days can be incomplete",
+            args.end_date,
+        )
 
-    property_ids = [p.strip().split("/")[-1] for p in args.properties.split(",") if p.strip()]
-    if not property_ids:
-        sys.exit("--properties must contain at least one property ID")
-
+    property_ids = parse_property_ids(args.properties)
     buckets = load_buckets(args.config)
     client = BetaAnalyticsDataClient()
 
@@ -199,7 +267,7 @@ def extract(args):
             log.info("%s starting (%s to %s)", label, args.start_date, args.end_date)
             try:
                 n = export_bucket(client, pid, bucket, args.start_date, args.end_date, csv_path, label)
-            except gexc.GoogleAPICallError as e:
+            except (gexc.GoogleAPICallError, gexc.RetryError, InconsistentReport) as e:
                 log.error("%s failed: %s", label, e)
                 failures.append((pid, bucket["name"], str(e)))
                 if os.path.exists(csv_path + ".part"):
@@ -230,7 +298,7 @@ def main():
     p_ext = sub.add_parser("extract", help="Export report buckets to CSV")
     p_ext.add_argument("--properties", required=True, help="Comma-separated GA4 property IDs")
     p_ext.add_argument("--start-date", required=True, help="YYYY-MM-DD")
-    p_ext.add_argument("--end-date", required=True, help="YYYY-MM-DD")
+    p_ext.add_argument("--end-date", required=True, help="YYYY-MM-DD, not in the future")
     p_ext.add_argument("--config", default="buckets.yaml", help="Bucket YAML file (default: buckets.yaml)")
     p_ext.add_argument("--out", default="./export", help="Output directory (default: ./export)")
     p_ext.set_defaults(func=extract)
@@ -241,8 +309,8 @@ def main():
     )
     try:
         return args.func(args)
-    except DefaultCredentialsError as e:
-        sys.exit(f"Could not load Google credentials (set GOOGLE_APPLICATION_CREDENTIALS): {e}")
+    except GoogleAuthError as e:
+        sys.exit(f"Google credentials problem (check GOOGLE_APPLICATION_CREDENTIALS): {e}")
 
 
 if __name__ == "__main__":

@@ -1,14 +1,23 @@
 """Unit tests for ga_export.py. No network: the GA4 clients are replaced with fakes."""
 
 import csv
+import functools
+import os
+import random
 import sys
+import time
+from datetime import date, timedelta
 from types import SimpleNamespace as NS
 
 import pytest
 from google.api_core import exceptions as gexc
-from google.auth.exceptions import DefaultCredentialsError
+from google.api_core import retry as gretry
+from google.auth.exceptions import DefaultCredentialsError, RefreshError
 
 import ga_export
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TODAY = date(2026, 9, 30)
 
 
 # ---------------------------------------------------------------- helpers
@@ -30,33 +39,70 @@ def fake_response(dims, mets, rows, row_count):
     )
 
 
-class PagedClient:
-    """Fake Data API client that serves `all_rows` in pages of `request.limit`."""
+class FakeClient:
+    """Base for fake Data API clients. Applies the retry policy the way the real
+    generated client does, so retry behaviour is exercised end to end."""
+
+    def __init__(self):
+        self.calls = 0
+        self.requests = []
+        self.kwargs = []
+
+    def run_report(self, request, retry=None, timeout=None):
+        self.kwargs.append({"retry": retry, "timeout": timeout})
+        attempt = functools.partial(self._attempt, request)
+        return retry(attempt)() if retry is not None else attempt()
+
+    def _attempt(self, request):
+        self.calls += 1
+        self.requests.append(request)
+        return self.respond(request)
+
+
+class PagedClient(FakeClient):
+    """Serves `all_rows` in pages of `request.limit`."""
 
     def __init__(self, all_rows, dims=("date",), mets=("sessions",)):
+        super().__init__()
         self.all_rows = all_rows
         self.dims, self.mets = list(dims), list(mets)
-        self.requests = []
 
-    def run_report(self, request):
-        self.requests.append(request)
+    def respond(self, request):
         page = self.all_rows[request.offset : request.offset + request.limit]
         return fake_response(self.dims, self.mets, page, len(self.all_rows))
 
 
-class ScriptedClient:
-    """Fake Data API client that returns or raises each scripted item in turn."""
+class ScriptedClient(FakeClient):
+    """Returns or raises each scripted item in turn."""
 
     def __init__(self, script):
+        super().__init__()
         self.script = list(script)
-        self.calls = 0
 
-    def run_report(self, request):
-        self.calls += 1
+    def respond(self, request):
         item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
+
+
+class RoutingClient(FakeClient):
+    """Behaviour depends on which non-date dimension the bucket asks for."""
+
+    def respond(self, request):
+        dims = [d.name for d in request.dimensions]
+        mets = [m.name for m in request.metrics]
+        if "bad" in dims:
+            raise gexc.InvalidArgument("Please remove bad to make the request compatible")
+        if "quota" in dims:
+            raise gexc.ResourceExhausted("Exhausted property tokens")
+        if "flaky" in dims and self.calls == 1:
+            raise gexc.ServiceUnavailable("try again")
+        if "shifting" in dims:
+            # Two rows in total, one per page, but the total changes between pages.
+            return fake_response(dims, mets, [["20240101"] + ["s"] * (len(dims) - 1) + ["1"] * len(mets)],
+                                 2 + request.offset)
+        return fake_response(dims, mets, [["20240101"] + ["x"] * (len(dims) - 1) + ["1"] * len(mets)], 1)
 
 
 def write_yaml(tmp_path, text):
@@ -66,22 +112,37 @@ def write_yaml(tmp_path, text):
 
 
 def read_csv(path):
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8") as f:
         return list(csv.reader(f))
 
 
 @pytest.fixture
-def no_sleep(monkeypatch):
-    sleeps = []
-    monkeypatch.setattr(ga_export.time, "sleep", sleeps.append)
-    return sleeps
+def fake_clock(monkeypatch):
+    """Make sleeps instant and deterministic: no jitter, and time.monotonic advances by
+    exactly the slept amount so retry deadlines are reached on schedule."""
+    clock = {"now": 1000.0, "sleeps": []}
+
+    def sleep(seconds):
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(time, "sleep", sleep)
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(random, "uniform", lambda low, high: high)
+    return clock["sleeps"]
+
+
+@pytest.fixture
+def fixed_today(monkeypatch):
+    monkeypatch.setattr(ga_export, "today", lambda: TODAY)
+    return TODAY
 
 
 # ---------------------------------------------------------------- load_buckets
 
 
 def test_load_buckets_shipped_config_is_valid():
-    buckets = ga_export.load_buckets("buckets.yaml")
+    buckets = ga_export.load_buckets(os.path.join(HERE, "buckets.yaml"))
     assert [b["name"] for b in buckets] == [
         "daily_totals", "acquisition", "geo_device", "pages", "conversions",
     ]
@@ -104,6 +165,13 @@ def test_load_buckets_missing_dimensions_key_defaults_to_date_only(tmp_path):
     assert b["dimensions"] == ["date"]
 
 
+@pytest.mark.parametrize("name", ["daily_totals", "geo-device", "pages.2024", "A1"])
+def test_load_buckets_accepts_safe_names(tmp_path, name):
+    path = write_yaml(tmp_path, f"buckets:\n  - name: '{name}'\n    metrics: [sessions]\n")
+    [b] = ga_export.load_buckets(path)
+    assert b["name"] == name
+
+
 @pytest.mark.parametrize(
     "text, message",
     [
@@ -115,11 +183,19 @@ def test_load_buckets_missing_dimensions_key_defaults_to_date_only(tmp_path):
         ("buckets:\n  - name: ''\n    metrics: [x]\n", "bucket #1 needs a non-empty string 'name'"),
         ("buckets:\n  - name: a\n    metrics: [x]\n  - name: a\n    metrics: [x]\n", "duplicate bucket name 'a'"),
         ("buckets:\n  - name: ../evil\n    metrics: [x]\n", "not a valid file name"),
+        ("buckets:\n  - name: 'a/b'\n    metrics: [x]\n", "not a valid file name"),
+        ("buckets:\n  - name: 'a\\\\b'\n    metrics: [x]\n", "not a valid file name"),
+        ("buckets:\n  - name: 'a b'\n    metrics: [x]\n", "not a valid file name"),
+        ("buckets:\n  - name: 'a:b'\n    metrics: [x]\n", "not a valid file name"),
+        ("buckets:\n  - name: '.hidden'\n    metrics: [x]\n", "not a valid file name"),
+        ("buckets:\n  - name: '..'\n    metrics: [x]\n", "not a valid file name"),
         ("buckets:\n  - name: a\n    dimensions: country\n    metrics: [x]\n", "'dimensions' must be a list of strings"),
         ("buckets:\n  - name: a\n    dimensions: [1]\n    metrics: [x]\n", "'dimensions' must be a list of strings"),
         ("buckets:\n  - name: a\n    dimensions: []\n", "'metrics' must be a non-empty list of strings"),
         ("buckets:\n  - name: a\n    metrics: []\n", "'metrics' must be a non-empty list of strings"),
         ("buckets:\n  - name: a\n    metrics: sessions\n", "'metrics' must be a non-empty list of strings"),
+        ("buckets:\n  - name: a\n    dimensions: [country, country]\n    metrics: [x]\n", "'dimensions' contains a duplicate"),
+        ("buckets:\n  - name: a\n    metrics: [sessions, sessions]\n", "'metrics' contains a duplicate"),
         ("buckets:\n  - name: a\n    dimensions: [a,b,c,d,e,f,g,h,i]\n    metrics: [x]\n", "has 10 dimensions including 'date'; the GA4 Data API allows at most 9"),
         ("buckets:\n  - name: a\n    metrics: [a,b,c,d,e,f,g,h,i,j,k]\n", "has 11 metrics; the GA4 Data API allows at most 10"),
         ("buckets: [\n", "Could not parse"),
@@ -143,7 +219,7 @@ def test_load_buckets_missing_file(tmp_path):
         ga_export.load_buckets(str(tmp_path / "nope.yaml"))
 
 
-# ---------------------------------------------------------------- parse_date
+# ---------------------------------------------------------------- parse_date / parse_property_ids
 
 
 def test_parse_date_valid():
@@ -156,39 +232,77 @@ def test_parse_date_invalid(value):
         ga_export.parse_date(value, "--end-date")
 
 
-# ---------------------------------------------------------------- run_with_retry
+def test_parse_property_ids_accepts_both_forms_and_whitespace():
+    assert ga_export.parse_property_ids(" 123 , properties/456,,789") == ["123", "456", "789"]
 
 
-def test_retry_returns_immediately_on_success(no_sleep):
+def test_parse_property_ids_drops_duplicates_with_warning(caplog):
+    with caplog.at_level("WARNING", logger="ga_export"):
+        assert ga_export.parse_property_ids("123,properties/123,456") == ["123", "456"]
+    assert "ignoring duplicate property ID 123" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["properties/", "123/", "abc", "properties/abc", "12 3", "-1"])
+def test_parse_property_ids_rejects_junk(value):
+    with pytest.raises(SystemExit, match="is not a GA4 property ID"):
+        ga_export.parse_property_ids(value)
+
+
+@pytest.mark.parametrize("value", ["", " , ", ","])
+def test_parse_property_ids_requires_at_least_one(value):
+    with pytest.raises(SystemExit, match="at least one property ID"):
+        ga_export.parse_property_ids(value)
+
+
+# ---------------------------------------------------------------- retry_policy
+
+
+def call_with_policy(client, request="req"):
+    return client.run_report(request, retry=ga_export.retry_policy("[l]"))
+
+
+def test_retry_policy_returns_immediately_on_success(fake_clock):
     client = ScriptedClient(["ok"])
-    assert ga_export.run_with_retry(client, "req", "[l]") == "ok"
+    assert call_with_policy(client) == "ok"
     assert client.calls == 1
-    assert no_sleep == []
+    assert fake_clock == []
 
 
-def test_retry_backs_off_exponentially_on_quota_errors(no_sleep):
-    client = ScriptedClient([gexc.ResourceExhausted("tokens"), gexc.TooManyRequests("slow down"), "ok"])
-    assert ga_export.run_with_retry(client, "req", "[l]") == "ok"
-    assert client.calls == 3
-    assert no_sleep == [5, 10]
+def test_retry_policy_retries_transient_errors_with_exponential_backoff(fake_clock):
+    client = ScriptedClient([
+        gexc.ResourceExhausted("tokens"),
+        gexc.TooManyRequests("slow down"),
+        gexc.ServiceUnavailable("503"),
+        gexc.InternalServerError("500"),
+        gexc.DeadlineExceeded("timeout"),
+        "ok",
+    ])
+    assert call_with_policy(client) == "ok"
+    assert client.calls == 6
+    assert fake_clock == [5, 10, 20, 40, 80]
 
 
-def test_retry_caps_backoff_and_gives_up_after_max_retries(no_sleep):
-    client = ScriptedClient([gexc.ResourceExhausted("tokens")] * (ga_export.MAX_RETRIES + 1))
-    with pytest.raises(gexc.ResourceExhausted):
-        ga_export.run_with_retry(client, "req", "[l]")
-    assert client.calls == ga_export.MAX_RETRIES + 1
-    assert len(no_sleep) == ga_export.MAX_RETRIES
-    assert no_sleep == [5, 10, 20, 40, 80, 160, 300, 300]
-    assert max(no_sleep) <= ga_export.MAX_BACKOFF_SECONDS
+def test_retry_policy_caps_sleep_and_gives_up_at_deadline(fake_clock, caplog):
+    client = ScriptedClient([gexc.ResourceExhausted("tokens")] * 50)
+    with caplog.at_level("WARNING", logger="ga_export"), pytest.raises(gexc.RetryError) as exc:
+        call_with_policy(client)
+    assert isinstance(exc.value.cause, gexc.ResourceExhausted)
+    assert "Timeout of 900.0s exceeded" in str(exc.value)
+    assert max(fake_clock) == ga_export.RETRY_MAX_SLEEP_SECONDS
+    assert sum(fake_clock) <= ga_export.RETRY_DEADLINE_SECONDS
+    assert fake_clock == [5, 10, 20, 40, 80, 160, 300]
+    assert client.calls == len(fake_clock) + 1
+    assert caplog.text.count("transient error (429 tokens); retrying") == client.calls
 
 
-def test_retry_does_not_retry_other_api_errors(no_sleep):
-    client = ScriptedClient([gexc.InvalidArgument("bad dimension"), "never reached"])
-    with pytest.raises(gexc.InvalidArgument):
-        ga_export.run_with_retry(client, "req", "[l]")
+@pytest.mark.parametrize("error", [gexc.InvalidArgument("bad dimension"), gexc.PermissionDenied("no access"),
+                                   gexc.NotFound("no such property")])
+def test_retry_policy_does_not_retry_other_api_errors(fake_clock, error):
+    client = ScriptedClient([error, "never reached"])
+    with pytest.raises(type(error)):
+        call_with_policy(client)
     assert client.calls == 1
-    assert no_sleep == []
+    assert fake_clock == []
 
 
 # ---------------------------------------------------------------- export_bucket
@@ -197,13 +311,18 @@ def test_retry_does_not_retry_other_api_errors(no_sleep):
 BUCKET = {"name": "b", "dimensions": ["date", "country"], "metrics": ["sessions", "totalUsers"]}
 
 
+def run_export(client, tmp_path, bucket=BUCKET, start="2024-01-01", end="2024-01-07"):
+    out = tmp_path / "b.csv"
+    n = ga_export.export_bucket(client, "123", bucket, start, end, str(out), "[l]")
+    return n, out
+
+
 def test_export_bucket_paginates_and_writes_csv(tmp_path, monkeypatch):
     monkeypatch.setattr(ga_export, "PAGE_LIMIT", 3)
     rows = [[f"2024010{i}", "US", str(i), str(i * 10)] for i in range(1, 8)]
     client = PagedClient(rows, dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
-    out = tmp_path / "b.csv"
 
-    n = ga_export.export_bucket(client, "123", BUCKET, "2024-01-01", "2024-01-07", str(out), "[l]")
+    n, out = run_export(client, tmp_path)
 
     assert n == 7
     assert read_csv(out) == [["date", "country", "sessions", "totalUsers"]] + rows
@@ -216,22 +335,21 @@ def test_export_bucket_stops_when_row_count_is_exact_multiple_of_page(tmp_path, 
     monkeypatch.setattr(ga_export, "PAGE_LIMIT", 3)
     rows = [[f"2024010{i}", "US", "1", "1"] for i in range(1, 7)]
     client = PagedClient(rows, dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
-    n = ga_export.export_bucket(client, "123", BUCKET, "2024-01-01", "2024-01-06", str(tmp_path / "b.csv"), "[l]")
+    n, _ = run_export(client, tmp_path)
     assert n == 6
     assert [r.offset for r in client.requests] == [0, 3]
 
 
 def test_export_bucket_empty_result_writes_header_only(tmp_path):
     client = PagedClient([], dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
-    out = tmp_path / "b.csv"
-    n = ga_export.export_bucket(client, "123", BUCKET, "2024-01-01", "2024-01-07", str(out), "[l]")
+    n, out = run_export(client, tmp_path)
     assert n == 0
     assert read_csv(out) == [["date", "country", "sessions", "totalUsers"]]
 
 
 def test_export_bucket_builds_request_from_bucket_and_dates(tmp_path):
     client = PagedClient([], dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
-    ga_export.export_bucket(client, "123", BUCKET, "2024-01-01", "2024-01-07", str(tmp_path / "b.csv"), "[l]")
+    run_export(client, tmp_path)
     [req] = client.requests
     assert req.property == "properties/123"
     assert [d.name for d in req.dimensions] == ["date", "country"]
@@ -239,46 +357,56 @@ def test_export_bucket_builds_request_from_bucket_and_dates(tmp_path):
     assert req.date_ranges[0].start_date == "2024-01-01"
     assert req.date_ranges[0].end_date == "2024-01-07"
     assert req.order_bys[0].dimension.dimension_name == "date"
-    assert req.limit == ga_export.PAGE_LIMIT == 100000
+    assert req.limit == ga_export.PAGE_LIMIT == 250000
     assert req.offset == 0
+
+
+def test_export_bucket_passes_retry_policy_and_timeout_to_every_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(ga_export, "PAGE_LIMIT", 1)
+    client = PagedClient([["20240101", "1"], ["20240102", "2"]])
+    run_export(client, tmp_path, bucket={"name": "x", "dimensions": ["date"], "metrics": ["sessions"]})
+    assert len(client.kwargs) == 2
+    for kw in client.kwargs:
+        assert isinstance(kw["retry"], gretry.Retry)
+        assert kw["timeout"] == ga_export.REQUEST_TIMEOUT_SECONDS == 300
 
 
 def test_export_bucket_uses_header_names_from_response(tmp_path):
     # The API echoes the names back; the CSV header should come from the response, not the YAML.
     client = PagedClient([["20240101", "1"]], dims=["date"], mets=["sessions"])
-    out = tmp_path / "b.csv"
-    ga_export.export_bucket(client, "1", {"name": "x", "dimensions": ["date"], "metrics": ["sessions"]},
-                            "2024-01-01", "2024-01-01", str(out), "[l]")
+    _, out = run_export(client, tmp_path, bucket={"name": "x", "dimensions": ["date"], "metrics": ["sessions"]})
     assert read_csv(out)[0] == ["date", "sessions"]
+
+
+def test_export_bucket_writes_utf8_regardless_of_locale(tmp_path):
+    title = "東京 — café ☕"
+    client = PagedClient([["20240101", title, "1", "1"]], dims=["date", "pageTitle"], mets=["sessions", "totalUsers"])
+    _, out = run_export(client, tmp_path)
+    assert title.encode("utf-8") in out.read_bytes()
+    assert read_csv(out)[1][1] == title
+
+
+def test_export_bucket_fails_when_row_count_changes_between_pages(tmp_path, monkeypatch):
+    monkeypatch.setattr(ga_export, "PAGE_LIMIT", 1)
+    dims, mets = BUCKET["dimensions"], BUCKET["metrics"]
+    client = ScriptedClient([
+        fake_response(dims, mets, [["20240101", "US", "1", "1"]], 3),
+        fake_response(dims, mets, [["20240101", "GB", "1", "1"]], 4),
+    ])
+    with pytest.raises(ga_export.InconsistentReport, match="row count changed from 3 to 4"):
+        run_export(client, tmp_path)
+    assert not (tmp_path / "b.csv").exists()
 
 
 def test_export_bucket_error_propagates_and_leaves_part_file(tmp_path):
     client = ScriptedClient([gexc.InvalidArgument("incompatible")])
-    out = tmp_path / "b.csv"
     with pytest.raises(gexc.InvalidArgument):
-        ga_export.export_bucket(client, "1", BUCKET, "2024-01-01", "2024-01-01", str(out), "[l]")
-    assert not out.exists()
+        run_export(client, tmp_path)
+    assert not (tmp_path / "b.csv").exists()
     assert (tmp_path / "b.csv.part").exists()  # extract() is responsible for cleaning this up
 
 
 # ---------------------------------------------------------------- extract
-
-
-class RoutingClient:
-    """Fake Data API client: behaviour depends on which non-date dimension the bucket asks for."""
-
-    def __init__(self):
-        self.calls = 0
-
-    def run_report(self, request):
-        self.calls += 1
-        dims = [d.name for d in request.dimensions]
-        mets = [m.name for m in request.metrics]
-        if "bad" in dims:
-            raise gexc.InvalidArgument("Please remove bad to make the request compatible")
-        if "quota" in dims:
-            raise gexc.ResourceExhausted("Exhausted property tokens")
-        return fake_response(dims, mets, [["20240101"] + ["x"] * (len(dims) - 1) + ["1"] * len(mets)], 1)
 
 
 def make_args(tmp_path, config_text, properties="111", start="2024-01-01", end="2024-01-02"):
@@ -291,16 +419,26 @@ def make_args(tmp_path, config_text, properties="111", start="2024-01-01", end="
     )
 
 
-GOOD_CONFIG = "buckets:\n  - name: good\n    metrics: [sessions]\n"
-MIXED_CONFIG = (
-    "buckets:\n"
-    "  - name: good\n    metrics: [sessions]\n"
-    "  - name: broken\n    dimensions: [bad]\n    metrics: [sessions]\n"
-)
+def bucket_yaml(*specs):
+    return "buckets:\n" + "".join(
+        f"  - name: {name}\n    dimensions: [{dim}]\n    metrics: [sessions]\n" if dim
+        else f"  - name: {name}\n    metrics: [sessions]\n"
+        for name, dim in specs
+    )
 
 
-def test_extract_writes_one_csv_per_property_per_bucket(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(ga_export, "BetaAnalyticsDataClient", RoutingClient)
+GOOD_CONFIG = bucket_yaml(("good", None))
+MIXED_CONFIG = bucket_yaml(("good", None), ("broken", "bad"))
+
+
+@pytest.fixture
+def routing_client(monkeypatch):
+    client = RoutingClient()
+    monkeypatch.setattr(ga_export, "BetaAnalyticsDataClient", lambda: client)
+    return client
+
+
+def test_extract_writes_one_csv_per_property_per_bucket(tmp_path, routing_client, fixed_today, capsys):
     args = make_args(tmp_path, GOOD_CONFIG, properties="111,properties/222")
 
     rc = ga_export.extract(args)
@@ -311,9 +449,7 @@ def test_extract_writes_one_csv_per_property_per_bucket(tmp_path, monkeypatch, c
     assert "Summary: 2 completed, 0 skipped, 0 failed" in capsys.readouterr().out
 
 
-def test_extract_skips_existing_csv(tmp_path, monkeypatch, capsys):
-    client = RoutingClient()
-    monkeypatch.setattr(ga_export, "BetaAnalyticsDataClient", lambda: client)
+def test_extract_skips_existing_csv(tmp_path, routing_client, fixed_today, capsys):
     args = make_args(tmp_path, GOOD_CONFIG)
     existing = tmp_path / "export" / "111" / "good.csv"
     existing.parent.mkdir(parents=True)
@@ -322,13 +458,12 @@ def test_extract_skips_existing_csv(tmp_path, monkeypatch, capsys):
     rc = ga_export.extract(args)
 
     assert rc == 0
-    assert client.calls == 0
+    assert routing_client.calls == 0
     assert existing.read_text() == "previous content\n"
     assert "Summary: 0 completed, 1 skipped, 0 failed" in capsys.readouterr().out
 
 
-def test_extract_records_failure_continues_and_cleans_part_file(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(ga_export, "BetaAnalyticsDataClient", RoutingClient)
+def test_extract_records_failure_continues_and_cleans_part_file(tmp_path, routing_client, fixed_today, capsys):
     args = make_args(tmp_path, MIXED_CONFIG, properties="111,222")
 
     rc = ga_export.extract(args)
@@ -345,28 +480,59 @@ def test_extract_records_failure_continues_and_cleans_part_file(tmp_path, monkey
         assert not (tmp_path / "export" / pid / "broken.csv.part").exists()
 
 
-def test_extract_exhausted_retries_count_as_failure(tmp_path, monkeypatch, no_sleep, capsys):
-    monkeypatch.setattr(ga_export, "BetaAnalyticsDataClient", RoutingClient)
-    args = make_args(tmp_path, "buckets:\n  - name: q\n    dimensions: [quota]\n    metrics: [sessions]\n")
+def test_extract_recovers_from_transient_error(tmp_path, routing_client, fixed_today, fake_clock, capsys):
+    args = make_args(tmp_path, bucket_yaml(("flaky", "flaky")))
 
     rc = ga_export.extract(args)
 
+    assert rc == 0
+    assert routing_client.calls == 2
+    assert fake_clock == [5]
+    assert "Summary: 1 completed, 0 skipped, 0 failed" in capsys.readouterr().out
+
+
+def test_extract_exhausted_retries_count_as_failure(tmp_path, routing_client, fixed_today, fake_clock, capsys):
+    args = make_args(tmp_path, bucket_yaml(("q", "quota")))
+
+    rc = ga_export.extract(args)
+
+    out = capsys.readouterr().out
     assert rc == 1
-    assert len(no_sleep) == ga_export.MAX_RETRIES
-    assert "Summary: 0 completed, 0 skipped, 1 failed" in capsys.readouterr().out
+    assert sum(fake_clock) <= ga_export.RETRY_DEADLINE_SECONDS
+    assert "Summary: 0 completed, 0 skipped, 1 failed" in out
+    assert "111  q  Timeout of 900.0s exceeded" in out
+    assert not (tmp_path / "export" / "111" / "q.csv.part").exists()
 
 
-def test_extract_rerun_after_failure_retries_only_failed_bucket(tmp_path, monkeypatch, capsys):
-    client = RoutingClient()
-    monkeypatch.setattr(ga_export, "BetaAnalyticsDataClient", lambda: client)
+def test_extract_inconsistent_report_counts_as_failure(tmp_path, routing_client, fixed_today, monkeypatch, capsys):
+    monkeypatch.setattr(ga_export, "PAGE_LIMIT", 1)
+    args = make_args(tmp_path, bucket_yaml(("moving", "shifting")))
+
+    rc = ga_export.extract(args)
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "111  moving  row count changed from 2 to 3 between pages" in out
+    assert not (tmp_path / "export" / "111" / "moving.csv").exists()
+    assert not (tmp_path / "export" / "111" / "moving.csv.part").exists()
+
+
+def test_extract_rerun_after_failure_retries_only_failed_bucket(tmp_path, routing_client, fixed_today, capsys):
     args = make_args(tmp_path, MIXED_CONFIG)
 
     ga_export.extract(args)
-    calls_after_first = client.calls
+    calls_after_first = routing_client.calls
     ga_export.extract(args)
 
-    assert client.calls == calls_after_first + 1  # only "broken" was attempted again
+    assert routing_client.calls == calls_after_first + 1  # only "broken" was attempted again
     assert "Summary: 0 completed, 1 skipped, 1 failed" in capsys.readouterr().out
+
+
+def test_extract_duplicate_property_is_exported_once(tmp_path, routing_client, fixed_today, capsys):
+    args = make_args(tmp_path, GOOD_CONFIG, properties="111,111")
+    assert ga_export.extract(args) == 0
+    assert routing_client.calls == 1
+    assert "Summary: 1 completed, 0 skipped, 0 failed" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -375,32 +541,52 @@ def test_extract_rerun_after_failure_retries_only_failed_bucket(tmp_path, monkey
         ({"start": "2024-02-01", "end": "2024-01-01"}, "is after --end-date"),
         ({"start": "bad"}, "--start-date must be YYYY-MM-DD"),
         ({"end": "bad"}, "--end-date must be YYYY-MM-DD"),
+        ({"end": "2026-10-01"}, "--end-date 2026-10-01 is in the future"),
         ({"properties": " , "}, "at least one property ID"),
+        ({"properties": "properties/"}, "is not a GA4 property ID"),
     ],
 )
-def test_extract_rejects_bad_arguments_before_any_api_call(tmp_path, monkeypatch, kwargs, message):
-    client = RoutingClient()
-    monkeypatch.setattr(ga_export, "BetaAnalyticsDataClient", lambda: client)
+def test_extract_rejects_bad_arguments_before_any_api_call(tmp_path, routing_client, fixed_today, kwargs, message):
     with pytest.raises(SystemExit) as exc:
         ga_export.extract(make_args(tmp_path, GOOD_CONFIG, **kwargs))
     assert message in str(exc.value)
-    assert client.calls == 0
+    assert routing_client.calls == 0
+
+
+@pytest.mark.parametrize("days_ago, warns", [(0, True), (1, True), (2, True), (3, False), (30, False)])
+def test_extract_warns_when_end_date_is_recent(tmp_path, routing_client, fixed_today, caplog, days_ago, warns):
+    end = (fixed_today - timedelta(days=days_ago)).isoformat()
+    args = make_args(tmp_path, GOOD_CONFIG, start="2024-01-01", end=end)
+    with caplog.at_level("WARNING", logger="ga_export"):
+        assert ga_export.extract(args) == 0
+    assert ("GA4 may still be processing" in caplog.text) is warns
+
+
+def test_extract_uses_real_today_by_default():
+    assert ga_export.today() == date.today()
 
 
 # ---------------------------------------------------------------- list_properties
 
 
+def admin_client(monkeypatch, summaries=None, error=None):
+    def list_account_summaries():
+        if error:
+            raise error
+        return summaries
+    monkeypatch.setattr(ga_export, "AnalyticsAdminServiceClient",
+                        lambda: NS(list_account_summaries=list_account_summaries))
+
+
 def test_list_properties_prints_table(monkeypatch, capsys):
-    summaries = [
+    admin_client(monkeypatch, summaries=[
         NS(display_name="Acme", property_summaries=[
             NS(property="properties/1", display_name="Acme Web"),
             NS(property="properties/22", display_name="Acme App"),
         ]),
         NS(display_name="Beta Co", property_summaries=[]),
         NS(display_name="Gamma", property_summaries=[NS(property="properties/333", display_name="G")]),
-    ]
-    monkeypatch.setattr(ga_export, "AnalyticsAdminServiceClient",
-                        lambda: NS(list_account_summaries=lambda: summaries))
+    ])
 
     assert ga_export.list_properties(NS()) == 0
 
@@ -415,10 +601,16 @@ def test_list_properties_prints_table(monkeypatch, capsys):
 
 
 def test_list_properties_handles_no_properties(monkeypatch, capsys):
-    monkeypatch.setattr(ga_export, "AnalyticsAdminServiceClient",
-                        lambda: NS(list_account_summaries=lambda: []))
+    admin_client(monkeypatch, summaries=[])
     assert ga_export.list_properties(NS()) == 0
     assert "No accessible properties found." in capsys.readouterr().out
+
+
+def test_list_properties_reports_api_errors_cleanly(monkeypatch):
+    admin_client(monkeypatch, error=gexc.PermissionDenied("Google Analytics Admin API has not been used"))
+    with pytest.raises(SystemExit) as exc:
+        ga_export.list_properties(NS())
+    assert str(exc.value) == "Could not list properties: 403 Google Analytics Admin API has not been used"
 
 
 # ---------------------------------------------------------------- main / CLI wiring
@@ -450,11 +642,13 @@ def test_main_extract_defaults_and_dispatch(monkeypatch):
     assert seen["out"] == "./export"
 
 
-def test_main_reports_missing_credentials_cleanly(monkeypatch):
+@pytest.mark.parametrize("error", [DefaultCredentialsError("no creds"), RefreshError("invalid_grant: key revoked")])
+def test_main_reports_credential_problems_cleanly(monkeypatch, error):
     def boom(args):
-        raise DefaultCredentialsError("no creds")
+        raise error
     monkeypatch.setattr(ga_export, "list_properties", boom)
     monkeypatch.setattr(sys, "argv", ["ga_export.py", "list-properties"])
     with pytest.raises(SystemExit) as exc:
         ga_export.main()
     assert "GOOGLE_APPLICATION_CREDENTIALS" in str(exc.value)
+    assert str(error) in str(exc.value)
