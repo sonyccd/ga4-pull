@@ -1,0 +1,5 @@
+.venv/
+export/
+*.csv.part
+__pycache__/
+*.json

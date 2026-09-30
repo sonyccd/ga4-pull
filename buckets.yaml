@@ -1,0 +1,20 @@
+buckets:
+  - name: daily_totals
+    dimensions: []
+    metrics: [sessions, totalUsers, newUsers, screenPageViews, engagedSessions]
+
+  - name: acquisition
+    dimensions: [sessionSource, sessionMedium, sessionCampaignName, sessionDefaultChannelGroup]
+    metrics: [sessions, totalUsers, newUsers, engagedSessions, keyEvents]
+
+  - name: geo_device
+    dimensions: [country, region, city, language, deviceCategory, browser, operatingSystem]
+    metrics: [sessions, totalUsers, screenPageViews]
+
+  - name: pages
+    dimensions: [landingPage, pagePath, pageTitle]
+    metrics: [sessions, totalUsers, screenPageViews, averageSessionDuration, screenPageViewsPerSession]
+
+  - name: conversions
+    dimensions: [sessionSource, sessionMedium, sessionCampaignName, eventName]
+    metrics: [keyEvents, sessionKeyEventRate, eventCount, totalRevenue]
