@@ -143,13 +143,26 @@ def load_buckets(path):
 # ---------------------------------------------------------------- extract
 
 
+def describe(e):
+    """One-line description of an error. str() on an API error appends the multi-line
+    gRPC details block, which is noise in a progress log and a summary."""
+    if isinstance(e, gexc.GoogleAPICallError):
+        text = " ".join(str(e.message).split())
+        if e.code:
+            text = f"{int(e.code)} {text}"
+        return f"{text} [{e.reason}]" if e.reason else text
+    if isinstance(e, gexc.RetryError):
+        return f"{e.message}, last exception: {describe(e.cause)}"
+    return str(e)
+
+
 def retry_policy(label):
     """Retry policy for one bucket: retries quota, 5xx and timeout errors with jittered
     exponential backoff (up to RETRY_MAX_SLEEP_SECONDS between attempts) for up to
     RETRY_DEADLINE_SECONDS, then raises google.api_core.exceptions.RetryError."""
 
     def on_error(exc):
-        log.warning("%s transient error (%s); retrying", label, exc)
+        log.warning("%s transient error (%s); retrying", label, describe(exc))
 
     return gretry.Retry(
         predicate=gretry.if_exception_type(*RETRYABLE_ERRORS),
@@ -252,12 +265,12 @@ def extract(args):
     buckets = load_buckets(args.config)
     client = BetaAnalyticsDataClient()
 
-    completed = skipped = 0
+    completed = skipped = failed = 0
     failures = []
     for pid in property_ids:
         prop_dir = os.path.join(args.out, pid)
         os.makedirs(prop_dir, exist_ok=True)
-        for bucket in buckets:
+        for i, bucket in enumerate(buckets):
             label = f"[{pid}/{bucket['name']}]"
             csv_path = os.path.join(prop_dir, f"{bucket['name']}.csv")
             if os.path.exists(csv_path):
@@ -268,16 +281,29 @@ def extract(args):
             try:
                 n = export_bucket(client, pid, bucket, args.start_date, args.end_date, csv_path, label)
             except (gexc.GoogleAPICallError, gexc.RetryError, InconsistentReport) as e:
-                log.error("%s failed: %s", label, e)
-                failures.append((pid, bucket["name"], str(e)))
+                message = describe(e)
+                log.error("%s failed: %s", label, message)
+                failures.append((pid, bucket["name"], message))
+                failed += 1
                 if os.path.exists(csv_path + ".part"):
                     os.remove(csv_path + ".part")
+                remaining = [b["name"] for b in buckets[i + 1:]]
+                if isinstance(e, gexc.Forbidden) and remaining:
+                    # A 403 is about the property, not the bucket: every other bucket
+                    # would fail the same way, so don't ask.
+                    log.error(
+                        "[%s] no access to this property; not attempting its remaining %d bucket(s)",
+                        pid, len(remaining),
+                    )
+                    failures.append((pid, ", ".join(remaining), f"not attempted: no access to property {pid}"))
+                    failed += len(remaining)
+                    break
                 continue
             log.info("%s done: %d rows -> %s", label, n, csv_path)
             completed += 1
 
     print()
-    print(f"Summary: {completed} completed, {skipped} skipped, {len(failures)} failed")
+    print(f"Summary: {completed} completed, {skipped} skipped, {failed} failed")
     if failures:
         print("Failures:")
         for pid, name, msg in failures:

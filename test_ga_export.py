@@ -13,6 +13,7 @@ import pytest
 from google.api_core import exceptions as gexc
 from google.api_core import retry as gretry
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
+from google.rpc import error_details_pb2
 
 import ga_export
 
@@ -92,6 +93,8 @@ class RoutingClient(FakeClient):
     def respond(self, request):
         dims = [d.name for d in request.dimensions]
         mets = [m.name for m in request.metrics]
+        if request.property == "properties/403":
+            raise make_403("PERMISSION_DENIED")
         if "bad" in dims:
             raise gexc.InvalidArgument("Please remove bad to make the request compatible")
         if "quota" in dims:
@@ -103,6 +106,16 @@ class RoutingClient(FakeClient):
             return fake_response(dims, mets, [["20240101"] + ["s"] * (len(dims) - 1) + ["1"] * len(mets)],
                                  2 + request.offset)
         return fake_response(dims, mets, [["20240101"] + ["x"] * (len(dims) - 1) + ["1"] * len(mets)], 1)
+
+
+def make_403(reason=None):
+    """A PermissionDenied shaped like the one the gRPC transport builds from a real 403."""
+    info = error_details_pb2.ErrorInfo(reason=reason, domain="analyticsdata.googleapis.com") if reason else None
+    return gexc.PermissionDenied(
+        "User does not have sufficient permissions for this property.",
+        details=[info] if info else (),
+        error_info=info,
+    )
 
 
 def write_yaml(tmp_path, text):
@@ -303,6 +316,32 @@ def test_retry_policy_does_not_retry_other_api_errors(fake_clock, error):
         call_with_policy(client)
     assert client.calls == 1
     assert fake_clock == []
+
+
+# ---------------------------------------------------------------- describe
+
+
+def test_describe_api_error_is_one_line_with_code_and_reason():
+    text = ga_export.describe(make_403("PERMISSION_DENIED"))
+    assert text == "403 User does not have sufficient permissions for this property. [PERMISSION_DENIED]"
+    assert "\n" not in text
+
+
+def test_describe_api_error_without_error_info():
+    assert ga_export.describe(gexc.InvalidArgument("bad dimension")) == "400 bad dimension"
+
+
+def test_describe_collapses_multiline_messages():
+    assert ga_export.describe(gexc.InvalidArgument("line one\n  line two")) == "400 line one line two"
+
+
+def test_describe_retry_error_names_the_last_cause():
+    err = gexc.RetryError("Timeout of 900.0s exceeded", gexc.ResourceExhausted("tokens", error_info=error_details_pb2.ErrorInfo(reason="RATE_LIMIT_EXCEEDED")))
+    assert ga_export.describe(err) == "Timeout of 900.0s exceeded, last exception: 429 tokens [RATE_LIMIT_EXCEEDED]"
+
+
+def test_describe_other_exceptions_use_str():
+    assert ga_export.describe(ga_export.InconsistentReport("row count changed")) == "row count changed"
 
 
 # ---------------------------------------------------------------- export_bucket
@@ -515,6 +554,45 @@ def test_extract_inconsistent_report_counts_as_failure(tmp_path, routing_client,
     assert "111  moving  row count changed from 2 to 3 between pages" in out
     assert not (tmp_path / "export" / "111" / "moving.csv").exists()
     assert not (tmp_path / "export" / "111" / "moving.csv.part").exists()
+
+
+def test_extract_property_403_skips_its_remaining_buckets_and_continues(tmp_path, routing_client, fixed_today, capsys):
+    config = bucket_yaml(("a", None), ("b", None), ("c", None))
+    args = make_args(tmp_path, config, properties="111,403,222")
+
+    rc = ga_export.extract(args)
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    # 111 and 222 export all three buckets; 403 is attempted exactly once.
+    assert [r.property for r in routing_client.requests].count("properties/403") == 1
+    assert routing_client.calls == 7
+    for pid in ("111", "222"):
+        for name in ("a", "b", "c"):
+            assert (tmp_path / "export" / pid / f"{name}.csv").exists()
+    assert not any((tmp_path / "export" / "403").glob("*"))
+    assert "Summary: 6 completed, 0 skipped, 3 failed" in out
+    assert "  403  a  403 User does not have sufficient permissions for this property. [PERMISSION_DENIED]" in out
+    assert "  403  b, c  not attempted: no access to property 403" in out
+    # The multi-line gRPC details block must not leak into the log or summary.
+    assert 'domain: "' not in out
+    assert "reason: " not in out
+
+
+def test_extract_property_403_on_last_bucket_records_only_that_bucket(tmp_path, routing_client, fixed_today, capsys):
+    args = make_args(tmp_path, GOOD_CONFIG, properties="403")
+    assert ga_export.extract(args) == 1
+    out = capsys.readouterr().out
+    assert "Summary: 0 completed, 0 skipped, 1 failed" in out
+    assert "not attempted" not in out
+
+
+def test_extract_failure_lines_are_single_line(tmp_path, routing_client, fixed_today, capsys):
+    args = make_args(tmp_path, MIXED_CONFIG)
+    ga_export.extract(args)
+    out = capsys.readouterr().out
+    failure_lines = out.split("Failures:\n", 1)[1].splitlines()
+    assert failure_lines == ["  111  broken  400 Please remove bad to make the request compatible"]
 
 
 def test_extract_rerun_after_failure_retries_only_failed_bucket(tmp_path, routing_client, fixed_today, capsys):
