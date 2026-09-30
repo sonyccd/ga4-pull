@@ -141,7 +141,8 @@ Because the skip check only looks at the file name, running with a different dat
 
 - On quota or rate-limit errors (HTTP 429, "exhausted property tokens"), server errors (500, 503) and request timeouts, the tool waits and retries the page with exponential backoff, starting around 5 seconds and growing to at most 5 minutes between attempts, for up to 15 minutes per page. If the error persists past that, the bucket is recorded as failed and the run continues.
 - Each request is given 5 minutes to complete. The GA4 client's built-in default of 60 seconds is too short for a full page of a large report.
-- Any other API error for a bucket (invalid or incompatible dimensions, no access to the property, and so on) is logged in full and the bucket is skipped. The run never aborts because of one bucket.
+- Any other API error for a bucket (invalid or incompatible dimensions and so on) is logged and the bucket is skipped. The run never aborts because of one bucket.
+- A 403 means the service account cannot read that property (or the Data API is not enabled on its project). The first bucket to hit it is recorded as failed, the property's remaining buckets are not attempted, and the run moves on to the next property. Grant the service account Viewer access, or enable the API, and rerun.
 - GA4 keeps processing data for a day or two after it arrives. The tool refuses an `--end-date` in the future and warns when it is within the last 48 hours. If a report changes while its pages are being fetched (the row count differs between pages), the bucket is recorded as failed rather than written with gaps or duplicates; rerun it once the data has settled.
 - High-cardinality buckets such as `pages` and `geo_device` over long date ranges can be large. GA4 may collapse rare rows into an `(other)` row when a property exceeds its cardinality limits; this is API behaviour, not something the tool can avoid. Shorter date ranges reduce it.
 
