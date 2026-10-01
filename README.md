@@ -139,12 +139,27 @@ Because the skip check only looks at the file name, running with a different dat
 
 ## Quotas and errors
 
-- On quota or rate-limit errors (HTTP 429, "exhausted property tokens"), server errors (500, 503) and request timeouts, the tool waits and retries the page with exponential backoff, starting around 5 seconds and growing to at most 5 minutes between attempts, for up to 15 minutes per page. If the error persists past that, the bucket is recorded as failed and the run continues.
-- Each request is given 5 minutes to complete. The GA4 client's built-in default of 60 seconds is too short for a full page of a large report.
-- Any other API error for a bucket (invalid or incompatible dimensions and so on) is logged and the bucket is skipped. The run never aborts because of one bucket.
-- A 403 means the service account cannot read that property (or the Data API is not enabled on its project). The first bucket to hit it is recorded as failed, the property's remaining buckets are not attempted, and the run moves on to the next property. Grant the service account Viewer access, or enable the API, and rerun.
+The GA4 Data API charges every request a number of **tokens** that grows with the date range, the number of rows and dimensions, and how high-cardinality those dimensions are. Each property has a token budget per hour and per day, and each Cloud project has its own per-property hourly budget on top. Hourly budgets refresh within an hour, not on the hour; daily budgets reset at midnight Pacific. The limits are in [Google's quota documentation](https://developers.google.com/analytics/devguides/reporting/data/v1/quotas); Analytics 360 properties get ten times the standard ones.
+
+Every page fetched is logged with its token cost and what is left:
+
+```
+INFO [123456789/geo_device] fetched 500000/32604919 rows (page cost 1420 tokens; remaining: 118600 project/hour, 378600 property/hour, 1798600 property/day)
+```
+
+Watch the `project/hour` number on a big bucket: it tells you how many more pages of that size fit in the current hour, and whether the whole bucket fits in a day.
+
+What the tool does when things go wrong:
+
+- **Server errors and timeouts** (500, 503, request timeout) are retried with exponential backoff, from about 5 seconds up to 5 minutes between attempts, for up to 15 minutes per page. Each request is given 5 minutes to complete; the GA4 client's built-in default of 60 seconds is too short for a full page of a large report.
+- **Hourly quota exhausted** (429, "Exhausted property tokens ... per hour"): the page is retried every few minutes, with gaps growing from about a minute to 5 minutes, for a little over an hour. Once the quota refreshes the page goes through and the bucket carries on. If it is still exhausted after that, the bucket is recorded as failed and the run continues with the next one.
+- **Daily quota exhausted** (429, "... per day"): nothing more will succeed until midnight Pacific, so the run stops. The current bucket and every bucket not yet attempted are listed in the summary. Rerun the same command the next day; completed buckets are skipped.
+- **A 403** means the service account cannot read that property (or the Data API is not enabled on its project). The first bucket to hit it is recorded as failed, the property's remaining buckets are not attempted, and the run moves on to the next property. Grant the service account Viewer access, or enable the API, and rerun.
+- **Any other API error** for a bucket (invalid or incompatible dimensions and so on) is logged and the bucket is skipped. The run never aborts because of one bucket.
 - GA4 keeps processing data for a day or two after it arrives. The tool refuses an `--end-date` in the future and warns when it is within the last 48 hours. If a report changes while its pages are being fetched (the row count differs between pages), the bucket is recorded as failed rather than written with gaps or duplicates; rerun it once the data has settled.
 - High-cardinality buckets such as `pages` and `geo_device` over long date ranges can be large. GA4 may collapse rare rows into an `(other)` row when a property exceeds its cardinality limits; this is API behaviour, not something the tool can avoid. Shorter date ranges reduce it.
+
+Note that a bucket is only ever written whole: if a run stops partway through a 100-page bucket, the next run starts that bucket from its first page. Buckets with tens of millions of rows cost a lot of tokens because every page re-runs the full query over the whole date range; exporting such a bucket a year at a time, into a separate `--out` directory per year, is much cheaper and resumes at a finer grain.
 
 ## Development
 

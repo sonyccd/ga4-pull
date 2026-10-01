@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import functools
 import logging
 import os
 import re
@@ -35,18 +36,25 @@ MAX_METRICS = 10
 BUCKET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 # The generated client gives run_report a 60s timeout and no retry. A full page can take
-# longer than that, and quota and 5xx errors are routine, so every page is sent with an
-# explicit per-attempt timeout and a jittered exponential-backoff retry policy.
+# longer than that, and 5xx errors are routine, so every page is sent with an explicit
+# per-attempt timeout and a jittered exponential-backoff retry policy for transient errors.
 REQUEST_TIMEOUT_SECONDS = 300
 RETRY_INITIAL_SECONDS = 5
 RETRY_MAX_SLEEP_SECONDS = 300
 RETRY_DEADLINE_SECONDS = 900
-RETRYABLE_ERRORS = (
-    gexc.TooManyRequests,  # 429; ResourceExhausted (quota) is a subclass
+TRANSIENT_ERRORS = (
     gexc.ServiceUnavailable,
     gexc.InternalServerError,
     gexc.DeadlineExceeded,
 )
+
+# Quota exhaustion (429) is not transient. GA4 hourly token quotas "are refreshed within an
+# hour but not necessarily on the whole hour boundaries", so a page that hits one is polled
+# every few minutes for a little over an hour. Daily quotas reset at midnight Pacific, so
+# there is no point waiting for those: the run stops and is resumed the next day.
+QUOTA_POLL_INITIAL_SECONDS = 60
+QUOTA_POLL_MAX_SECONDS = 300
+QUOTA_WAIT_SECONDS = 3900
 
 log = logging.getLogger("ga_export")
 
@@ -156,16 +164,24 @@ def describe(e):
     return str(e)
 
 
-def retry_policy(label):
-    """Retry policy for one bucket: retries quota, 5xx and timeout errors with jittered
-    exponential backoff (up to RETRY_MAX_SLEEP_SECONDS between attempts) for up to
-    RETRY_DEADLINE_SECONDS, then raises google.api_core.exceptions.RetryError."""
+def is_quota_error(e):
+    return isinstance(e, gexc.TooManyRequests)  # 429; ResourceExhausted is a subclass
+
+
+def is_daily_quota_error(e):
+    return is_quota_error(e) and re.search(r"\b(day|daily)\b", str(e.message), re.I) is not None
+
+
+def transient_policy(label):
+    """Retries 5xx and timeout errors with jittered exponential backoff (up to
+    RETRY_MAX_SLEEP_SECONDS between attempts) for up to RETRY_DEADLINE_SECONDS, then raises
+    google.api_core.exceptions.RetryError."""
 
     def on_error(exc):
         log.warning("%s transient error (%s); retrying", label, describe(exc))
 
     return gretry.Retry(
-        predicate=gretry.if_exception_type(*RETRYABLE_ERRORS),
+        predicate=gretry.if_exception_type(*TRANSIENT_ERRORS),
         initial=RETRY_INITIAL_SECONDS,
         maximum=RETRY_MAX_SLEEP_SECONDS,
         multiplier=2,
@@ -174,10 +190,38 @@ def retry_policy(label):
     )
 
 
+def quota_policy(label):
+    """Waits out an exhausted hourly quota: polls with growing, jittered gaps (up to
+    QUOTA_POLL_MAX_SECONDS) for up to QUOTA_WAIT_SECONDS, then raises RetryError. Daily
+    quota errors are not retried."""
+
+    def on_error(exc):
+        log.warning(
+            "%s quota exhausted (%s); waiting for the hourly quota to refresh", label, describe(exc)
+        )
+
+    return gretry.Retry(
+        predicate=lambda e: is_quota_error(e) and not is_daily_quota_error(e),
+        initial=QUOTA_POLL_INITIAL_SECONDS,
+        maximum=QUOTA_POLL_MAX_SECONDS,
+        multiplier=2,
+        timeout=QUOTA_WAIT_SECONDS,
+        on_error=on_error,
+    )
+
+
+def fetch_page(client, request, label):
+    """Run one report request. Transient errors are retried quickly inside; hourly quota
+    exhaustion is waited out around that, with a fresh transient budget after each wait."""
+    call = functools.partial(
+        client.run_report, request, retry=transient_policy(label), timeout=REQUEST_TIMEOUT_SECONDS
+    )
+    return quota_policy(label)(call)()
+
+
 def export_bucket(client, property_id, bucket, start_date, end_date, csv_path, label):
     """Stream every page of the report into csv_path + '.part', then rename. Returns row count."""
     part_path = csv_path + ".part"
-    retry = retry_policy(label)
     offset = 0
     total = None
     with open(part_path, "w", newline="", encoding="utf-8") as f:
@@ -191,8 +235,9 @@ def export_bucket(client, property_id, bucket, start_date, end_date, csv_path, l
                 order_bys=[OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="date"))],
                 limit=PAGE_LIMIT,
                 offset=offset,
+                return_property_quota=True,
             )
-            response = client.run_report(request, retry=retry, timeout=REQUEST_TIMEOUT_SECONDS)
+            response = fetch_page(client, request, label)
             if total is None:
                 total = response.row_count
                 writer.writerow(
@@ -211,7 +256,14 @@ def export_bucket(client, property_id, bucket, start_date, end_date, csv_path, l
                 )
             page_rows = len(response.rows)
             offset += page_rows
-            log.info("%s fetched %d/%d rows", label, offset, total)
+            quota = response.property_quota
+            log.info(
+                "%s fetched %d/%d rows (page cost %d tokens; remaining: %d project/hour, "
+                "%d property/hour, %d property/day)",
+                label, offset, total, quota.tokens_per_day.consumed,
+                quota.tokens_per_project_per_hour.remaining, quota.tokens_per_hour.remaining,
+                quota.tokens_per_day.remaining,
+            )
             if page_rows == 0 or offset >= total:
                 break
     os.replace(part_path, csv_path)
@@ -267,7 +319,18 @@ def extract(args):
 
     completed = skipped = failed = 0
     failures = []
+    stop_reason = None  # set when nothing further can succeed today
+
+    def not_attempted(pid, names, reason):
+        nonlocal failed
+        if names:
+            failures.append((pid, ", ".join(names), f"not attempted: {reason}"))
+            failed += len(names)
+
     for pid in property_ids:
+        if stop_reason:
+            not_attempted(pid, [b["name"] for b in buckets], stop_reason)
+            continue
         prop_dir = os.path.join(args.out, pid)
         os.makedirs(prop_dir, exist_ok=True)
         for i, bucket in enumerate(buckets):
@@ -288,6 +351,14 @@ def extract(args):
                 if os.path.exists(csv_path + ".part"):
                     os.remove(csv_path + ".part")
                 remaining = [b["name"] for b in buckets[i + 1:]]
+                if is_daily_quota_error(e):
+                    log.error(
+                        "[%s] daily token quota exhausted; it resets at midnight Pacific time. "
+                        "Stopping now; rerun tomorrow and completed buckets will be skipped.", pid,
+                    )
+                    stop_reason = "daily quota exhausted"
+                    not_attempted(pid, remaining, stop_reason)
+                    break
                 if isinstance(e, gexc.Forbidden) and remaining:
                     # A 403 is about the property, not the bucket: every other bucket
                     # would fail the same way, so don't ask.
@@ -295,8 +366,7 @@ def extract(args):
                         "[%s] no access to this property; not attempting its remaining %d bucket(s)",
                         pid, len(remaining),
                     )
-                    failures.append((pid, ", ".join(remaining), f"not attempted: no access to property {pid}"))
-                    failed += len(remaining)
+                    not_attempted(pid, remaining, f"no access to property {pid}")
                     break
                 continue
             log.info("%s done: %d rows -> %s", label, n, csv_path)
