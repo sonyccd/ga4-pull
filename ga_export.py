@@ -56,6 +56,16 @@ QUOTA_POLL_INITIAL_SECONDS = 60
 QUOTA_POLL_MAX_SECONDS = 300
 QUOTA_WAIT_SECONDS = 3900
 
+# A report is fetched in date windows, not as one query over the whole range. Every page
+# of a runReport re-runs its query, and the token cost and server time of that query grow
+# with the date range, so a 30M-row bucket over three years paginated with offsets is 100+
+# requests that each cost ~20k tokens, take a minute, and are often killed with a 5xx; it
+# cannot finish inside the daily quota. Instead the first window is a week, and each
+# later window is sized from the rows just seen so that it holds about one page. A window
+# may grow by at most WINDOW_GROWTH per step and never shrinks below one day.
+WINDOW_INITIAL_DAYS = 7
+WINDOW_GROWTH = 4
+
 log = logging.getLogger("ga_export")
 
 
@@ -219,55 +229,86 @@ def fetch_page(client, request, label):
     return quota_policy(label)(call)()
 
 
+def next_window_days(days, rows):
+    """Length of the next date window given that the last `days`-day window held `rows`
+    rows: long enough to hold about one page at that density, at most WINDOW_GROWTH times
+    longer than the last one, and at least one day."""
+    if rows == 0:
+        return days * WINDOW_GROWTH
+    return max(1, min(days * WINDOW_GROWTH, days * PAGE_LIMIT // rows))
+
+
 def export_bucket(client, property_id, bucket, start_date, end_date, csv_path, label):
-    """Stream every page of the report into csv_path + '.part', then rename. Returns row count."""
+    """Stream the report into csv_path + '.part' one date window at a time, then rename.
+    Returns the row count. Rows are ordered by date; the window boundaries fall between
+    days, so a row appears in exactly one window."""
     part_path = csv_path + ".part"
-    offset = 0
-    total = None
+    cursor, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+    days = WINDOW_INITIAL_DAYS
+    written = 0
+    first = True
     with open(part_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        while True:
-            request = RunReportRequest(
-                property=f"properties/{property_id}",
-                dimensions=[Dimension(name=d) for d in bucket["dimensions"]],
-                metrics=[Metric(name=m) for m in bucket["metrics"]],
-                date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
-                order_bys=[OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="date"))],
-                limit=PAGE_LIMIT,
-                offset=offset,
-                return_property_quota=True,
+        while cursor <= end:
+            window_end = min(cursor + timedelta(days=days - 1), end)
+            rows = export_window(
+                client, property_id, bucket, cursor, window_end, writer, label, written, first
             )
-            response = fetch_page(client, request, label)
-            if total is None:
-                total = response.row_count
+            first = False
+            written += rows
+            days = next_window_days((window_end - cursor).days + 1, rows)
+            cursor = window_end + timedelta(days=1)
+    os.replace(part_path, csv_path)
+    return written
+
+
+def export_window(client, property_id, bucket, start, end, writer, label, written_before, write_header):
+    """Fetch every page of one date window and write its rows, preceded by the CSV header
+    when write_header is set. Returns the number of rows in the window."""
+    window = f"{start.isoformat()}..{end.isoformat()}"
+    offset = 0
+    total = None
+    while True:
+        request = RunReportRequest(
+            property=f"properties/{property_id}",
+            dimensions=[Dimension(name=d) for d in bucket["dimensions"]],
+            metrics=[Metric(name=m) for m in bucket["metrics"]],
+            date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+            order_bys=[OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="date"))],
+            limit=PAGE_LIMIT,
+            offset=offset,
+            return_property_quota=True,
+        )
+        response = fetch_page(client, request, label)
+        if total is None:
+            total = response.row_count
+            if write_header:
                 writer.writerow(
                     [h.name for h in response.dimension_headers]
                     + [h.name for h in response.metric_headers]
                 )
-            elif response.row_count != total:
-                raise InconsistentReport(
-                    f"row count changed from {total} to {response.row_count} between pages; "
-                    "the report is still changing (is --end-date too recent?)"
-                )
-            for row in response.rows:
-                writer.writerow(
-                    [v.value for v in row.dimension_values]
-                    + [v.value for v in row.metric_values]
-                )
-            page_rows = len(response.rows)
-            offset += page_rows
-            quota = response.property_quota
-            log.info(
-                "%s fetched %d/%d rows (page cost %d tokens; remaining: %d project/hour, "
-                "%d property/hour, %d property/day)",
-                label, offset, total, quota.tokens_per_day.consumed,
-                quota.tokens_per_project_per_hour.remaining, quota.tokens_per_hour.remaining,
-                quota.tokens_per_day.remaining,
+        elif response.row_count != total:
+            raise InconsistentReport(
+                f"row count changed from {total} to {response.row_count} between pages of "
+                f"{window}; the report is still changing (is --end-date too recent?)"
             )
-            if page_rows == 0 or offset >= total:
-                break
-    os.replace(part_path, csv_path)
-    return offset
+        for row in response.rows:
+            writer.writerow(
+                [v.value for v in row.dimension_values]
+                + [v.value for v in row.metric_values]
+            )
+        page_rows = len(response.rows)
+        offset += page_rows
+        quota = response.property_quota
+        log.info(
+            "%s %s fetched %d/%d rows (%d written so far; page cost %d tokens; remaining: "
+            "%d project/hour, %d property/hour, %d property/day)",
+            label, window, offset, total, written_before + offset, quota.tokens_per_day.consumed,
+            quota.tokens_per_project_per_hour.remaining, quota.tokens_per_hour.remaining,
+            quota.tokens_per_day.remaining,
+        )
+        if page_rows == 0 or offset >= total:
+            return offset
 
 
 def parse_date(value, flag):

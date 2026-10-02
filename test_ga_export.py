@@ -88,7 +88,8 @@ class FakeClient:
 
 
 class PagedClient(FakeClient):
-    """Serves `all_rows` in pages of `request.limit`."""
+    """Serves the rows of `all_rows` (first column YYYYMMDD) that fall inside the request's
+    date range, in pages of `request.limit`."""
 
     def __init__(self, all_rows, dims=("date",), mets=("sessions",)):
         super().__init__()
@@ -96,8 +97,25 @@ class PagedClient(FakeClient):
         self.dims, self.mets = list(dims), list(mets)
 
     def respond(self, request):
-        page = self.all_rows[request.offset : request.offset + request.limit]
-        return fake_response(self.dims, self.mets, page, len(self.all_rows))
+        [dr] = request.date_ranges
+        lo, hi = dr.start_date.replace("-", ""), dr.end_date.replace("-", "")
+        rows = [r for r in self.all_rows if lo <= r[0] <= hi]
+        page = rows[request.offset : request.offset + request.limit]
+        return fake_response(self.dims, self.mets, page, len(rows))
+
+
+def windows(client):
+    """(start, end, offset) of every request a client saw."""
+    return [(r.date_ranges[0].start_date, r.date_ranges[0].end_date, r.offset) for r in client.requests]
+
+
+def daily_rows(start, days, per_day=1, dims_extra=("US",), mets=("1", "1")):
+    """`per_day` rows for each of `days` consecutive days from `start`."""
+    out = []
+    for i in range(days):
+        d = (start + timedelta(days=i)).strftime("%Y%m%d")
+        out += [[d, *dims_extra, *mets] for _ in range(per_day)]
+    return out
 
 
 class ScriptedClient(FakeClient):
@@ -502,8 +520,8 @@ def test_export_bucket_logs_page_cost_and_remaining_quota(tmp_path, monkeypatch,
     ])
     with caplog.at_level("INFO", logger="ga_export"):
         run_export(client, tmp_path)
-    assert "[l] fetched 1/2 rows (page cost 1500 tokens; remaining: 120000 project/hour, 380000 property/hour, 1800000 property/day)" in caplog.text
-    assert "[l] fetched 2/2 rows (page cost 1400 tokens; remaining: 118600 project/hour, 378600 property/hour, 1798600 property/day)" in caplog.text
+    assert "[l] 2024-01-01..2024-01-07 fetched 1/2 rows (1 written so far; page cost 1500 tokens; remaining: 120000 project/hour, 380000 property/hour, 1800000 property/day)" in caplog.text
+    assert "[l] 2024-01-01..2024-01-07 fetched 2/2 rows (2 written so far; page cost 1400 tokens; remaining: 118600 project/hour, 378600 property/hour, 1798600 property/day)" in caplog.text
 
 
 def test_export_bucket_passes_transient_policy_and_timeout_to_every_call(tmp_path, monkeypatch):
@@ -549,6 +567,96 @@ def test_export_bucket_error_propagates_and_leaves_part_file(tmp_path):
         run_export(client, tmp_path)
     assert not (tmp_path / "b.csv").exists()
     assert (tmp_path / "b.csv.part").exists()  # extract() is responsible for cleaning this up
+
+
+# ---------------------------------------------------------------- export_bucket: date windows
+
+
+def test_export_bucket_first_window_is_a_week_and_later_windows_hold_one_page(tmp_path, monkeypatch):
+    # 1 row/day, pages of 5: the opening 7-day window needs 2 pages, after which the tool
+    # learns the density and asks for 5 days (= one page) at a time.
+    monkeypatch.setattr(ga_export, "PAGE_LIMIT", 5)
+    rows = daily_rows(date(2024, 1, 1), 17)
+    client = PagedClient(rows, dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
+
+    n, out = run_export(client, tmp_path, start="2024-01-01", end="2024-01-17")
+
+    assert n == 17
+    assert read_csv(out) == [["date", "country", "sessions", "totalUsers"]] + rows
+    assert windows(client) == [
+        ("2024-01-01", "2024-01-07", 0),
+        ("2024-01-01", "2024-01-07", 5),
+        ("2024-01-08", "2024-01-12", 0),
+        ("2024-01-13", "2024-01-17", 0),
+    ]
+
+
+def test_export_bucket_window_grows_at_most_fourfold_when_data_is_sparse(tmp_path, monkeypatch):
+    monkeypatch.setattr(ga_export, "PAGE_LIMIT", 5)
+    # Nothing in January; one row a day from 1 February.
+    rows = daily_rows(date(2024, 2, 1), 29)
+    client = PagedClient(rows, dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
+
+    n, out = run_export(client, tmp_path, start="2024-01-01", end="2024-02-29")
+
+    assert n == 29
+    assert read_csv(out)[1:] == rows
+    starts = [w[0] for w in windows(client) if w[2] == 0]
+    # 7 days (empty) -> 28 days (4 rows, so ~35 days would fit a page) -> capped at 4x = 112 -> end.
+    assert starts == ["2024-01-01", "2024-01-08", "2024-02-05"]
+    assert windows(client)[-1][1] == "2024-02-29"
+
+
+def test_export_bucket_window_never_shrinks_below_one_day(tmp_path, monkeypatch):
+    monkeypatch.setattr(ga_export, "PAGE_LIMIT", 3)
+    # 10 rows/day is more than a page per day; the window floors at one day and paginates it.
+    rows = daily_rows(date(2024, 1, 1), 9, per_day=10)
+    client = PagedClient(rows, dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
+
+    n, out = run_export(client, tmp_path, start="2024-01-01", end="2024-01-09")
+
+    assert n == 90
+    assert read_csv(out)[1:] == rows
+    seen = windows(client)
+    assert seen[0] == ("2024-01-01", "2024-01-07", 0)
+    assert [w for w in seen if w[2] == 0][1:] == [
+        ("2024-01-08", "2024-01-08", 0),
+        ("2024-01-09", "2024-01-09", 0),
+    ]
+    assert [w[2] for w in seen if w[0] == "2024-01-08"] == [0, 3, 6, 9]
+
+
+def test_export_bucket_windows_do_not_overlap_or_leave_gaps(tmp_path, monkeypatch):
+    monkeypatch.setattr(ga_export, "PAGE_LIMIT", 4)
+    rows = daily_rows(date(2023, 12, 25), 40, per_day=3)
+    client = PagedClient(rows, dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
+
+    n, out = run_export(client, tmp_path, start="2023-12-25", end="2024-02-02")
+
+    assert n == 120
+    assert read_csv(out)[1:] == rows  # every row exactly once, in date order
+    firsts = [w for w in windows(client) if w[2] == 0]
+    assert firsts[0][0] == "2023-12-25" and firsts[-1][1] == "2024-02-02"
+    for (_, prev_end, _), (next_start, _, _) in zip(firsts, firsts[1:]):
+        assert date.fromisoformat(next_start) == date.fromisoformat(prev_end) + timedelta(days=1)
+
+
+def test_export_bucket_row_count_check_is_per_window(tmp_path, monkeypatch):
+    # Different windows legitimately have different totals; only a change between pages
+    # of the same window is an inconsistency.
+    monkeypatch.setattr(ga_export, "PAGE_LIMIT", 5)
+    rows = daily_rows(date(2024, 1, 1), 7) + daily_rows(date(2024, 1, 8), 5, per_day=2)
+    client = PagedClient(rows, dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
+    n, out = run_export(client, tmp_path, start="2024-01-01", end="2024-01-12")
+    assert n == 17
+    assert read_csv(out)[1:] == rows
+
+
+def test_export_bucket_single_window_when_range_fits_in_the_first_one(tmp_path):
+    client = PagedClient(daily_rows(date(2024, 1, 1), 3), dims=BUCKET["dimensions"], mets=BUCKET["metrics"])
+    n, _ = run_export(client, tmp_path, start="2024-01-01", end="2024-01-03")
+    assert n == 3
+    assert windows(client) == [("2024-01-01", "2024-01-03", 0)]
 
 
 # ---------------------------------------------------------------- extract
